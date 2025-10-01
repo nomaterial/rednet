@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# rednet.sh — Réseau libvirt "Red zone" NATé via wg0-mullvad, DNS Mullvad, fail-closed.
+# Usage: sudo ./rednet.sh {up|down|status}
+
 sudo -v || exit 1
 set -euo pipefail
 
@@ -11,7 +14,7 @@ SUBNET_V4="10.77.0.0/24"
 GW_V4="10.77.0.1"
 DNS_MULLVAD_INTERNAL="10.64.0.1"
 XML_FILE="/tmp/${NET_NAME}.xml"
-STATE_DIR="/run/rednet"
+STATE_DIR="/run/${NET_NAME}"
 IPFWD_FILE="${STATE_DIR}/ip_forward.prev"
 
 # --- Utilitaires ---
@@ -111,16 +114,41 @@ nft_down() {
 mullvad_fix_forward() {
   have nft || return 0
   if ! sudo nft list chain inet mullvad forward 2>/dev/null | \
-       grep -q 'ip saddr 10\.77\.0\.0/24 .* iif "virbr1" .* oif "wg0-mullvad" .* accept'; then
+       grep -q 'ip saddr 10\.77\.0\.0/24 .* iifname "virbr1" .* oifname "wg0-mullvad" .* accept'; then
     sudo nft insert rule inet mullvad forward \
       ip saddr 10.77.0.0/24 iifname "virbr1" oifname "wg0-mullvad" accept || true
   fi
   if ! sudo nft list chain inet mullvad forward 2>/dev/null | \
-       grep -q 'ct state established,related .* iif "wg0-mullvad" .* oif "virbr1" .* accept'; then
+       grep -q 'ct state established,related .* iifname "wg0-mullvad" .* oifname "virbr1" .* accept'; then
     sudo nft insert rule inet mullvad forward \
       ct state established,related iifname "wg0-mullvad" oifname "virbr1" accept || true
   fi
 }
+
+# --- Mullvad unfix (retrait propre) ---
+# --- Mullvad unfix (retrait propre & agressif) ---
+mullvad_unfix_forward() {
+  local dump handles
+  dump="$(sudo nft -a list chain inet mullvad forward 2>/dev/null || true)"
+  [ -n "$dump" ] || return 0
+
+  # 1) supprimer TOUTE règle qui mentionne virbr1 (peu importe le sens)
+  handles="$(printf '%s\n' "$dump" | grep -E 'iifname "virbr1"|oifname "virbr1"' | awk '{print $NF}')"
+  for h in $handles; do
+    sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true
+  done
+
+  # 2) ceinture+bretelles : re-scan ciblant les couples wg0<->virbr1
+  dump="$(sudo nft -a list chain inet mullvad forward 2>/dev/null || true)"
+  [ -n "$dump" ] || return 0
+  handles="$(printf '%s\n' "$dump" | \
+    grep -E 'iifname "wg0-mullvad".*oifname "virbr1"|iifname "virbr1".*oifname "wg0-mullvad"' | awk '{print $NF}')"
+  for h in $handles; do
+    sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true
+  done
+}
+
+
 
 # --- NAT: MASQUERADE 10.77.0.0/24 -> wg0-mullvad (idempotent) ---
 nat_up() {
@@ -131,10 +159,23 @@ nat_up() {
     sudo nft add chain ip nat postrouting '{ type nat hook postrouting priority 100; }'
   fi
   if ! sudo nft list chain ip nat postrouting 2>/dev/null | \
-       grep -q 'oif "wg0-mullvad" ip saddr 10\.77\.0\.0/24 masquerade'; then
+       grep -q 'oifname "wg0-mullvad" ip saddr 10\.77\.0\.0/24 masquerade'; then
     sudo nft add rule ip nat postrouting oifname "wg0-mullvad" ip saddr 10.77.0.0/24 masquerade
   fi
 }
+
+# --- NAT down (retrait propre) ---
+nat_down() {
+  local dump handles
+  dump="$(sudo nft -a list chain ip nat postrouting 2>/dev/null || true)"
+  [ -n "$dump" ] || return 0
+  handles="$(printf '%s\n' "$dump" | \
+    awk '/oifname "wg0-mullvad" ip saddr 10\.77\.0\.0\/24 masquerade/ {print $NF}')"
+  for h in $handles; do
+    sudo nft delete rule ip nat postrouting handle "$h" 2>/dev/null || true
+  done
+}
+
 
 # --- UFW: règles route + DNS (idempotent & safe) ---
 ufw_apply() {
@@ -158,7 +199,6 @@ ufw_apply() {
 ufw_remove() {
   have ufw || return 0
 
-  # IMPORTANT: la syntaxe correcte est "ufw route delete ..."
   sudo ufw route delete allow in on "${BR_NAME}" out on "${WG_IF}"  from "${SUBNET_V4}" to any || true
   sudo ufw route delete allow in on "${WG_IF}" out on "${BR_NAME}"  from any to "${SUBNET_V4}" || true
 
@@ -185,7 +225,7 @@ ipfwd_down() {
   if [[ -f "$IPFWD_FILE" ]]; then
     local prev
     prev="$(cat "$IPFWD_FILE")"
-    sudo sysctl -w net.ipv4.ip_forward="$prev" >/dev/null
+    sudo sysctl -w net.ipv4/ip_forward="$prev" >/dev/null 2>&1 || sudo sysctl -w net.ipv4.ip_forward="$prev" >/dev/null
     sudo rm -f "$IPFWD_FILE"
   else
     sudo sysctl -w net.ipv4.ip_forward=0 >/dev/null
@@ -210,16 +250,15 @@ cmd_up() {
   require virsh nft systemctl awk sed grep
   [[ -d /sys/class/net/$WG_IF ]] || die "interface $WG_IF introuvable"
 
-  if have mullvad; then
-    mullvad lan set allow >/dev/null 2>&1 || true
-  fi
+  # (optionnel) si tu utilises Mullvad LAN=block, pas besoin de set allow ici
+  # if have mullvad; then mullvad lan set allow >/dev/null 2>&1 || true; fi
 
   local state
   state="$(cat /sys/class/net/$WG_IF/operstate 2>/dev/null || echo down)"
   case "$state" in up|unknown) : ;; *) die "$WG_IF est $state (Mullvad actif ?)" ;; esac
 
   /bin/mkdir -p "$STATE_DIR"
-  trap 'nft_down; ipfwd_down' INT TERM ERR
+  trap 'nft_down; mullvad_unfix_forward; nat_down; ipfwd_down' INT TERM ERR
 
   start_daemons
   ipfwd_up
@@ -239,19 +278,22 @@ cmd_up() {
 
   local BR; BR="$(bridge_name)"
   echo "[+] $NET_NAME UP  | bridge=${BR:-?}  | GW=${GW_V4}  | NAT via $WG_IF"
-  echo "[i] dnsmasq rednet:"
+  echo "[i] dnsmasq ${NET_NAME}:"
   sudo grep -E '^(server=|no-resolv)' /var/lib/libvirt/dnsmasq/${NET_NAME}.conf || true
 }
 
 cmd_down() {
   ufw_remove
   nft_down
+  mullvad_unfix_forward
+  nat_down
   if net_active;  then vsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true; fi
   if net_defined; then vsh net-undefine "$NET_NAME" >/dev/null 2>&1 || true; fi
   ipfwd_down
   stop_daemons
-  echo "[+] $NET_NAME DOWN (UFW nettoyé, nftables nettoyé, ip_forward restauré, sockets libvirt stoppés)"
+  echo "[+] $NET_NAME DOWN (nettoyé proprement)"
 }
+
 
 cmd_status() {
   if net_defined; then vsh net-info "$NET_NAME" || true; else echo "[i] réseau $NET_NAME non défini"; fi
