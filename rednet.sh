@@ -1,11 +1,10 @@
 #!/usr/bin/env bash
-# rednet.sh — Réseau libvirt "Red zone" NATé via wg0-mullvad, DNS Mullvad, fail-closed.
+# rednet.sh — Réseau libvirt "Red zone" via wg0-mullvad, DNS Mullvad, fail-closed.
 # Usage: sudo ./rednet.sh {up|down|status}
 
 sudo -v || exit 1
 set -euo pipefail
 
-# --- Paramètres ---
 URI="qemu:///system"
 NET_NAME="rednet"
 WG_IF="wg0-mullvad"
@@ -17,24 +16,19 @@ XML_FILE="/tmp/${NET_NAME}.xml"
 STATE_DIR="/run/${NET_NAME}"
 IPFWD_FILE="${STATE_DIR}/ip_forward.prev"
 
-# --- Utilitaires ---
 have()    { command -v "$1" >/dev/null 2>&1; }
 die()     { echo "[-] $*" >&2; exit 1; }
 require() { for c in "$@"; do have "$c" || die "commande manquante: $c"; done; }
 vsh()     { LC_ALL=C sudo virsh -c "$URI" "$@"; }
 
-# --- État réseau libvirt ---
 net_defined() { vsh net-info "$NET_NAME" >/dev/null 2>&1; }
 net_active()  { vsh net-info "$NET_NAME" 2>/dev/null | awk -F': *' '/^Active:/ {print tolower($2)}' | grep -q yes; }
 bridge_name() { vsh net-info "$NET_NAME" 2>/dev/null | awk -F': *' '/^Bridge:/ {print $2}'; }
 
-# --- Démarrage daemons (on-demand) ---
 start_daemons() {
-  local sockets=(
-    libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket
-    virtqemud.socket virtnetworkd.socket virtlogd.socket virtlockd.socket
-    virtstoraged.socket virtproxyd.socket virtproxyd-admin.socket
-  )
+  local sockets=(libvirtd.socket libvirtd-ro.socket libvirtd-admin.socket
+                 virtqemud.socket virtnetworkd.socket virtlogd.socket virtlockd.socket
+                 virtstoraged.socket virtproxyd.socket virtproxyd-admin.socket)
   sudo systemctl start "${sockets[@]}" 2>/dev/null || true
   for _ in {1..60}; do
     [[ -S /run/libvirt/libvirt-sock      || -S /var/run/libvirt/libvirt-sock      ]] && api=1 || api=0
@@ -57,7 +51,6 @@ stop_daemons() {
     virtstoraged.socket virtproxyd.socket virtproxyd-admin.socket 2>/dev/null || true
 }
 
-# --- XML réseau (NAT via wg0-mullvad + DNS Mullvad interne) ---
 write_xml() {
   cat > "$XML_FILE" <<XML
 <network xmlns:dnsmasq="http://libvirt.org/schemas/network/dnsmasq/1.0">
@@ -77,7 +70,6 @@ write_xml() {
 XML
 }
 
-# --- nftables guard (fail-closed, DNS forcé, egress=wg0) ---
 nft_up() {
   sudo nft -f - <<'NFT'
 table inet rednet_guard {
@@ -110,7 +102,6 @@ nft_down() {
     sudo nft delete table inet rednet_guard || true
 }
 
-# --- Exceptions Mullvad (autoriser ce forward précis virbr1 <-> wg0) ---
 mullvad_fix_forward() {
   have nft || return 0
   if ! sudo nft list chain inet mullvad forward 2>/dev/null | \
@@ -125,32 +116,18 @@ mullvad_fix_forward() {
   fi
 }
 
-# --- Mullvad unfix (retrait propre) ---
-# --- Mullvad unfix (retrait propre & agressif) ---
 mullvad_unfix_forward() {
   local dump handles
   dump="$(sudo nft -a list chain inet mullvad forward 2>/dev/null || true)"
   [ -n "$dump" ] || return 0
-
-  # 1) supprimer TOUTE règle qui mentionne virbr1 (peu importe le sens)
   handles="$(printf '%s\n' "$dump" | grep -E 'iifname "virbr1"|oifname "virbr1"' | awk '{print $NF}')"
-  for h in $handles; do
-    sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true
-  done
-
-  # 2) ceinture+bretelles : re-scan ciblant les couples wg0<->virbr1
+  for h in $handles; do sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true; done
   dump="$(sudo nft -a list chain inet mullvad forward 2>/dev/null || true)"
   [ -n "$dump" ] || return 0
-  handles="$(printf '%s\n' "$dump" | \
-    grep -E 'iifname "wg0-mullvad".*oifname "virbr1"|iifname "virbr1".*oifname "wg0-mullvad"' | awk '{print $NF}')"
-  for h in $handles; do
-    sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true
-  done
+  handles="$(printf '%s\n' "$dump" | grep -E 'iifname "wg0-mullvad".*oifname "virbr1"|iifname "virbr1".*oifname "wg0-mullvad"' | awk '{print $NF}')"
+  for h in $handles; do sudo nft delete rule inet mullvad forward handle "$h" 2>/dev/null || true; done
 }
 
-
-
-# --- NAT: MASQUERADE 10.77.0.0/24 -> wg0-mullvad (idempotent) ---
 nat_up() {
   if ! sudo nft list tables 2>/dev/null | grep -q '^table ip nat$'; then
     sudo nft add table ip nat
@@ -164,67 +141,49 @@ nat_up() {
   fi
 }
 
-# --- NAT down (retrait propre) ---
 nat_down() {
   local dump handles
   dump="$(sudo nft -a list chain ip nat postrouting 2>/dev/null || true)"
   [ -n "$dump" ] || return 0
-  handles="$(printf '%s\n' "$dump" | \
-    awk '/oifname "wg0-mullvad" ip saddr 10\.77\.0\.0\/24 masquerade/ {print $NF}')"
-  for h in $handles; do
-    sudo nft delete rule ip nat postrouting handle "$h" 2>/dev/null || true
-  done
+  handles="$(printf '%s\n' "$dump" | awk '/oifname "wg0-mullvad" ip saddr 10\.77\.0\.0\/24 masquerade/ {print $NF}')"
+  for h in $handles; do sudo nft delete rule ip nat postrouting handle "$h" 2>/dev/null || true; done
 }
 
-
-# --- UFW: règles route + DNS (idempotent & safe) ---
 ufw_apply() {
   have ufw || return 0
-
   sudo ufw route allow in on "${BR_NAME}" out on "${WG_IF}"  from "${SUBNET_V4}" to any || true
   sudo ufw route allow in on "${WG_IF}" out on "${BR_NAME}"  from any to "${SUBNET_V4}" || true
-
   if ip link show wlp0s20f3 >/dev/null 2>&1; then
     sudo ufw route deny  in on "${BR_NAME}" out on wlp0s20f3 || true
     sudo ufw route deny  in on wlp0s20f3 out on "${BR_NAME}" || true
   fi
-
   sudo ufw allow in on "${BR_NAME}" proto udp from "${SUBNET_V4}" to "${GW_V4}" port 53 || true
   sudo ufw allow in on "${BR_NAME}" proto tcp from "${SUBNET_V4}" to "${GW_V4}" port 53 || true
-
   sudo ufw reload || true
 }
 
-# --- UFW: retrait propre au down() ---
 ufw_remove() {
   have ufw || return 0
-
   sudo ufw route delete allow in on "${BR_NAME}" out on "${WG_IF}"  from "${SUBNET_V4}" to any || true
   sudo ufw route delete allow in on "${WG_IF}" out on "${BR_NAME}"  from any to "${SUBNET_V4}" || true
-
   if ip link show wlp0s20f3 >/dev/null 2>&1; then
     sudo ufw route delete deny  in on "${BR_NAME}" out on wlp0s20f3 || true
     sudo ufw route delete deny  in on wlp0s20f3 out on "${BR_NAME}" || true
   fi
-
   sudo ufw delete allow in on "${BR_NAME}" proto udp from "${SUBNET_V4}" to "${GW_V4}" port 53 || true
   sudo ufw delete allow in on "${BR_NAME}" proto tcp from "${SUBNET_V4}" to "${GW_V4}" port 53 || true
-
   sudo ufw reload || true
 }
 
-# --- ip_forward toggle (restaure l'état initial) ---
 ipfwd_up() {
   sudo mkdir -p "$STATE_DIR"
-  local prev
-  prev="$(cat /proc/sys/net/ipv4/ip_forward)"
+  local prev; prev="$(cat /proc/sys/net/ipv4/ip_forward)"
   echo "$prev" | sudo tee "$IPFWD_FILE" >/dev/null
   sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
 }
 ipfwd_down() {
   if [[ -f "$IPFWD_FILE" ]]; then
-    local prev
-    prev="$(cat "$IPFWD_FILE")"
+    local prev; prev="$(cat "$IPFWD_FILE")"
     sudo sysctl -w net.ipv4/ip_forward="$prev" >/dev/null 2>&1 || sudo sysctl -w net.ipv4.ip_forward="$prev" >/dev/null
     sudo rm -f "$IPFWD_FILE"
   else
@@ -232,7 +191,6 @@ ipfwd_down() {
   fi
 }
 
-# --- Bridge sanity: forcer vnet* -> virbr1 si non attaché ---
 ensure_bridge_ports() {
   if ip link show "${BR_NAME}" | grep -q NO-CARRIER; then
     for p in /sys/class/net/vnet*; do
@@ -245,27 +203,45 @@ ensure_bridge_ports() {
   fi
 }
 
-# --- Commandes ---
+dnsmasq_cleanup() {
+  sudo rm -f "/var/lib/libvirt/dnsmasq/${NET_NAME}.conf" \
+             "/var/lib/libvirt/dnsmasq/${NET_NAME}.status" 2>/dev/null || true
+}
+
+wait_net_gone() {
+  for _ in {1..50}; do
+    if ! net_defined; then return 0; fi
+    sleep 0.1
+  done
+  return 1
+}
+
+bridge_cleanup() {
+  if net_defined; then return 0; fi
+  if ip link show "${BR_NAME}" >/dev/null 2>&1; then
+    sudo ip link set "${BR_NAME}" down || true
+    sudo ip addr flush dev "${BR_NAME}" || true
+    sudo ip link delete "${BR_NAME}" type bridge || true
+  fi
+}
+
 cmd_up() {
   require virsh nft systemctl awk sed grep
   [[ -d /sys/class/net/$WG_IF ]] || die "interface $WG_IF introuvable"
 
-  # (optionnel) si tu utilises Mullvad LAN=block, pas besoin de set allow ici
-  # if have mullvad; then mullvad lan set allow >/dev/null 2>&1 || true; fi
-
-  local state
-  state="$(cat /sys/class/net/$WG_IF/operstate 2>/dev/null || echo down)"
+  start_daemons
+  local state; state="$(cat /sys/class/net/$WG_IF/operstate 2>/dev/null || echo down)"
   case "$state" in up|unknown) : ;; *) die "$WG_IF est $state (Mullvad actif ?)" ;; esac
 
   /bin/mkdir -p "$STATE_DIR"
-  trap 'nft_down; mullvad_unfix_forward; nat_down; ipfwd_down' INT TERM ERR
+  trap 'ufw_remove; nft_down; mullvad_unfix_forward; nat_down; vsh net-destroy "'"$NET_NAME"'" >/dev/null 2>&1 || true; vsh net-undefine "'"$NET_NAME"'" >/dev/null 2>&1 || true; dnsmasq_cleanup; ipfwd_down' INT TERM ERR
 
-  start_daemons
   ipfwd_up
-
   write_xml
+
   if net_active;  then vsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true; fi
   if net_defined; then vsh net-undefine "$NET_NAME" >/dev/null 2>&1 || true; fi
+
   vsh net-define "$XML_FILE"
   vsh net-autostart "$NET_NAME" --disable >/dev/null 2>&1 || true
   vsh net-start "$NET_NAME" >/dev/null 2>&1 || die "échec de démarrage réseau $NET_NAME"
@@ -277,21 +253,71 @@ cmd_up() {
   ensure_bridge_ports
 
   local BR; BR="$(bridge_name)"
-  echo "[+] $NET_NAME UP  | bridge=${BR:-?}  | GW=${GW_V4}  | NAT via $WG_IF"
+  echo "[+] $NET_NAME UP  | bridge=${BR:-$BR_NAME}  | GW=${GW_V4}  | NAT via $WG_IF"
   echo "[i] dnsmasq ${NET_NAME}:"
   sudo grep -E '^(server=|no-resolv)' /var/lib/libvirt/dnsmasq/${NET_NAME}.conf || true
 }
 
 cmd_down() {
-  ufw_remove
-  nft_down
-  mullvad_unfix_forward
-  nat_down
-  if net_active;  then vsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true; fi
-  if net_defined; then vsh net-undefine "$NET_NAME" >/dev/null 2>&1 || true; fi
-  ipfwd_down
-  stop_daemons
-  echo "[+] $NET_NAME DOWN (nettoyé proprement)"
+  # 0) Nettoyage firewall/nft (sans faire échouer le script)
+  ufw_remove || true
+  nft_down || true
+
+  # 1) Empêcher tout autostart résiduel
+  vsh net-autostart "$NET_NAME" --disable >/dev/null 2>&1 || true
+
+  # 2) Détruire puis undefine, avec retry
+  for i in 1 2 3; do
+    vsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true
+    sleep 0.2
+    # Double-tap si encore actif
+    vsh net-destroy "$NET_NAME" >/dev/null 2>&1 || true
+    sleep 0.2
+
+    vsh net-undefine "$NET_NAME" >/dev/null 2>&1 || true
+    sleep 0.2
+
+    # Si encore visible en "net-list --all", on retente
+    if ! vsh net-list --all 2>/dev/null | awk 'NR>2 && $1==n {f=1} END{exit !f}' n="$NET_NAME"; then
+      break
+    fi
+  done
+
+  # 3) Purge fichiers libvirt/dnsmasq (parfois laissés par virtnetworkd)
+  sudo rm -f /etc/libvirt/qemu/networks/${NET_NAME}.xml \
+              /etc/libvirt/qemu/networks/autostart/${NET_NAME}.xml \
+              /var/lib/libvirt/dnsmasq/${NET_NAME}.conf \
+              /var/lib/libvirt/dnsmasq/${NET_NAME}.status 2>/dev/null || true
+
+  # 4) Si le bridge traîne, on le détruit explicitement
+  if ip link show "${BR_NAME}" >/dev/null 2>&1; then
+    sudo ip link set "${BR_NAME}" down || true
+    # Essai via iproute2
+    sudo ip link del "${BR_NAME}" type bridge 2>/dev/null || \
+    # fallback générique (si iproute2 refuse)
+    sudo ip link del "${BR_NAME}" 2>/dev/null || true
+  fi
+
+  # 5) Assurer l'état ip_forward restauré quoi qu'il arrive
+  ipfwd_down || true
+
+  # 6) Stopper les sockets libvirt (optionnel, pour libérer les locks)
+  stop_daemons || true
+
+  # 7) Attendre la disparition effective (jusqu’à 1s) — purement esthétique mais utile au debug
+  for _ in 1 2 3 4 5; do
+    if ! vsh net-list --all 2>/dev/null | awk 'NR>2 && $1==n {f=1} END{exit !f}' n="$NET_NAME" \
+       && ! ip link show "${BR_NAME}" >/dev/null 2>&1; then
+      printf "[+] %s DOWN (nettoyé proprement)\n" "$NET_NAME"
+      return 0
+    fi
+    sleep 0.2
+  done
+
+  # 8) Dernier état
+  echo "[-] Avertissement: ${NET_NAME} ou ${BR_NAME} semblent encore présents."
+  vsh net-list --all || true
+  ip a show "${BR_NAME}" || true
 }
 
 
